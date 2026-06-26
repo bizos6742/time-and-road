@@ -385,6 +385,7 @@ function cityListView(route) {
 function routeMapView(route) {
   const mapCity = orderedCities(route).find((city) => city.id === state.mapCityId) || null;
   const mapError = state.mapErrors[route.id];
+  const mapNotice = route.map?.error || state.mapData[route.id]?.error || "";
   return `
     <div class="map-layout">
       <div class="route-map" id="route-map">
@@ -392,6 +393,7 @@ function routeMapView(route) {
       </div>
       ${mapCity ? mapCityPanel(mapCity) : `<aside class="map-panel"><p class="muted">点击地图上的城市标记，查看这座城市的笔记摘要。</p></aside>`}
     </div>
+    ${mapNotice && !mapError ? `<p class="toast">${esc(mapNotice)}</p>` : ""}
     ${distanceView(route)}
   `;
 }
@@ -435,19 +437,28 @@ function distanceView(route) {
   const map = route.map || {};
   const distanceError = state.distanceErrors[route.id] || map.error || "";
   const isLoading = Boolean(state.distanceLoading[route.id]);
-  const total = map.total_distance_km ?? map.totalDistanceKm;
+  const formatDistance = (value) => {
+    const distance = Number(value);
+    return Number.isFinite(distance) ? `${distance} km` : "待计算";
+  };
+  const formatDuration = (value) => {
+    const duration = Number(value);
+    return Number.isFinite(duration) ? ` · ${duration}h` : "";
+  };
+  const total = Number(map.total_distance_km ?? map.totalDistanceKm);
   const segments = map.segments || [];
-  const longest = segments.reduce((winner, segment) => {
-    const distance = segment.distance_km ?? segment.distanceKm ?? 0;
-    const winnerDistance = winner ? (winner.distance_km ?? winner.distanceKm ?? 0) : -1;
+  const successfulSegments = segments.filter((segment) => Number.isFinite(Number(segment.distance_km ?? segment.distanceKm)));
+  const longest = successfulSegments.reduce((winner, segment) => {
+    const distance = Number(segment.distance_km ?? segment.distanceKm);
+    const winnerDistance = winner ? Number(winner.distance_km ?? winner.distanceKm) : -1;
     return distance > winnerDistance ? segment : winner;
   }, null);
   return `
     <div class="distance-panel">
       <div class="distance-overview">
-        <span>总距离：${total ? `${total} km` : "待计算"}</span>
+        <span>总距离：${Number.isFinite(total) ? `${total} km` : "待计算"}</span>
         <span>共 ${segments.length} 段</span>
-        <span>最长路段：${longest ? `${esc(longest.from)} → ${esc(longest.to)}，${longest.distance_km ?? longest.distanceKm} km` : "待计算"}</span>
+        <span>最长路段：${longest ? `${esc(longest.from)} → ${esc(longest.to)}，${formatDistance(longest.distance_km ?? longest.distanceKm)}` : "待计算"}</span>
       </div>
       <div class="segment-strip">
         ${segments.map((segment) => `
@@ -456,8 +467,8 @@ function distanceView(route) {
           ${segment.failed || segment.error ? `
             <div class="muted">计算失败：${esc(segment.error || "高德接口暂时不可用")}</div>
           ` : `
-            <div class="muted">${segment.distance_km ?? segment.distanceKm} km${segment.duration_hours || segment.durationHours ? ` · ${segment.duration_hours ?? segment.durationHours}h` : ""}</div>
-            <a class="link" href="${esc(segment.navigation_url || segment.navigationUrl)}" target="_blank" rel="noreferrer">打开高德导航</a>
+            <div class="muted">${formatDistance(segment.distance_km ?? segment.distanceKm)}${formatDuration(segment.duration_hours ?? segment.durationHours)}</div>
+            ${segment.navigation_url || segment.navigationUrl ? `<a class="link" href="${esc(segment.navigation_url || segment.navigationUrl)}" target="_blank" rel="noreferrer">打开高德导航</a>` : ""}
           `}
         </div>
         `).join("") || `<div class="segment-card muted">还没有计算距离。</div>`}

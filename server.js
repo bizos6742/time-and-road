@@ -13,11 +13,15 @@ const PORT = Number(process.env.PORT || 4173);
 const AMAP_WEB_SERVICE_KEY = process.env.AMAP_WEB_SERVICE_KEY || "";
 const AMAP_JS_API_KEY = process.env.AMAP_JS_API_KEY || "";
 const AMAP_SECURITY_JS_CODE = process.env.AMAP_SECURITY_JS_CODE || "";
+const AMAP_REQUEST_INTERVAL_MS = 420;
 let amapScriptCache = "";
 let amapScriptPromise = null;
+let amapWebQueue = Promise.resolve();
+let lastAmapWebRequestAt = 0;
 
 const emptyData = {
   settings: { volcanoKey: "" },
+  geocodeCache: {},
   distanceCache: {},
   routes: []
 };
@@ -79,6 +83,7 @@ function normalizeCities(cities = []) {
 }
 
 function normalizeData(data) {
+  data.geocodeCache = data.geocodeCache || {};
   data.distanceCache = data.distanceCache || {};
   for (const route of data.routes || []) {
     route.cities = normalizeCities(route.cities || []);
@@ -124,6 +129,16 @@ function normalizeData(data) {
     }
     route.start = route.start || route.cities[0]?.name || "";
     route.end = route.end || route.cities.at(-1)?.name || "";
+    for (const mapCity of route.map?.cities || []) {
+      if (!data.geocodeCache[mapCity.name] && hasValidCoordinate(mapCity)) {
+        data.geocodeCache[mapCity.name] = {
+          lng: Number(mapCity.lng),
+          lat: Number(mapCity.lat),
+          location: `${Number(mapCity.lng)},${Number(mapCity.lat)}`,
+          updatedAt: route.map.updated_at || route.updatedAt || new Date().toISOString()
+        };
+      }
+    }
   }
 }
 
@@ -143,6 +158,31 @@ function routeCitiesSignature(route) {
   return normalizeCities(route.cities || [])
     .map((city) => `${city.id}:${city.name}:${city.order}:${city.enabled !== false}`)
     .join("|");
+}
+
+function enabledSegmentPairs(route) {
+  const enabledCities = normalizeCities(route.cities || []).filter((city) => city.enabled !== false && city.name);
+  return enabledCities.slice(0, -1).map((city, index) => [city.name, enabledCities[index + 1].name]);
+}
+
+function hasCompleteMapCities(route) {
+  const mapCities = route.map?.cities || [];
+  return normalizeCities(route.cities || [])
+    .filter((city) => city.name)
+    .every((city) => {
+      const mapCity = mapCities.find((entry) => entry.id === city.id || entry.name === city.name);
+      return hasValidCoordinate(mapCity);
+    });
+}
+
+function hasCompleteDistanceSegments(route) {
+  const segments = route.map?.segments || [];
+  const pairs = enabledSegmentPairs(route);
+  if (segments.length !== pairs.length) return false;
+  return pairs.every(([from, to]) => {
+    const segment = segments.find((entry) => entry.from === from && entry.to === to);
+    return segment && Number.isFinite(Number(segment.distance_km ?? segment.distanceKm));
+  });
 }
 
 function preserveRouteFields(route) {
@@ -168,6 +208,14 @@ function segmentCacheKey(from, to) {
 
 function isRateLimitError(error) {
   return /CUQPS_HAS_EXCEEDED_THE_LIMIT|10021|请求过快|限流/.test(error?.message || "");
+}
+
+function rateLimitMessage() {
+  return "请求过快，请稍后再试";
+}
+
+function hasValidCoordinate(value) {
+  return Number.isFinite(Number(value?.lng)) && Number.isFinite(Number(value?.lat));
 }
 
 function newCity(name, order = 0) {
@@ -241,9 +289,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function amapWebJson(url, label) {
+  const run = amapWebQueue.then(async () => {
+    const elapsed = Date.now() - lastAmapWebRequestAt;
+    if (elapsed < AMAP_REQUEST_INTERVAL_MS) await sleep(AMAP_REQUEST_INTERVAL_MS - elapsed);
+    lastAmapWebRequestAt = Date.now();
+    console.log(`[amap] ${label}`);
+    return httpsJson(url);
+  });
+  amapWebQueue = run.catch(() => {});
+  return run;
+}
+
 async function geocodeCity(city, key) {
   const url = `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(key)}&address=${encodeURIComponent(city)}`;
-  const data = await httpsJson(url);
+  const data = await amapWebJson(url, `geocode ${city}`);
   if (data.status && data.status !== "1") {
     throw new Error(`城市地理编码失败：${city}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
   }
@@ -254,10 +314,11 @@ async function geocodeCity(city, key) {
 }
 
 async function drivingDistance(from, to, key, geocodes = null) {
-  const origin = geocodes?.get(from) || await geocodeCity(from, key);
-  const destination = geocodes?.get(to) || await geocodeCity(to, key);
+  const origin = geocodes?.get(from);
+  const destination = geocodes?.get(to);
+  if (!origin || !destination) throw new Error(`缺少城市坐标：${from} 到 ${to}`);
   const url = `https://restapi.amap.com/v3/direction/driving?key=${encodeURIComponent(key)}&origin=${origin.location}&destination=${destination.location}`;
-  const data = await httpsJson(url);
+  const data = await amapWebJson(url, `direction ${from} -> ${to}`);
   if (data.status && data.status !== "1") {
     throw new Error(`direction 接口失败：${from} 到 ${to}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
   }
@@ -280,27 +341,64 @@ async function drivingDistance(from, to, key, geocodes = null) {
   };
 }
 
-async function geocodeRouteCities(orderedCities, key, cachedCities = []) {
-  const geocodes = new Map();
-  for (const city of orderedCities) {
-    const cached = cachedCities.find((entry) => (
-      (entry.id && entry.id === city.id) || entry.name === city.name
-    ));
-    if (cached && Number.isFinite(Number(cached.lng)) && Number.isFinite(Number(cached.lat))) {
-      geocodes.set(city.name, {
-        location: `${Number(cached.lng)},${Number(cached.lat)}`,
-        lng: Number(cached.lng),
-        lat: Number(cached.lat)
-      });
-    }
+function cachedGeocode(cityName, data, cachedCities = []) {
+  const cache = data.geocodeCache?.[cityName];
+  if (hasValidCoordinate(cache)) {
+    return {
+      location: cache.location || `${Number(cache.lng)},${Number(cache.lat)}`,
+      lng: Number(cache.lng),
+      lat: Number(cache.lat),
+      cached: true
+    };
   }
+  const cached = cachedCities.find((entry) => entry.name === cityName && hasValidCoordinate(entry));
+  if (cached) {
+    return {
+      location: `${Number(cached.lng)},${Number(cached.lat)}`,
+      lng: Number(cached.lng),
+      lat: Number(cached.lat),
+      cached: true
+    };
+  }
+  return null;
+}
+
+async function geocodeRouteCities(orderedCities, key, data, cachedCities = []) {
+  const geocodes = new Map();
+  const failures = {};
+  let rateLimited = false;
+  data.geocodeCache = data.geocodeCache || {};
   const uniqueNames = [...new Set(orderedCities.map((city) => city.name).filter(Boolean))];
+  for (const cityName of uniqueNames) {
+    const cached = cachedGeocode(cityName, data, cachedCities);
+    if (cached) geocodes.set(cityName, cached);
+  }
   const missingNames = uniqueNames.filter((cityName) => !geocodes.has(cityName));
   for (const cityName of missingNames) {
-    if (geocodes.size) await sleep(180);
-    geocodes.set(cityName, await geocodeCity(cityName, key));
+    if (rateLimited) {
+      failures[cityName] = rateLimitMessage();
+      continue;
+    }
+    const start = Date.now();
+    try {
+      const geo = await geocodeCity(cityName, key);
+      geocodes.set(cityName, geo);
+      data.geocodeCache[cityName] = {
+        lng: geo.lng,
+        lat: geo.lat,
+        location: geo.location,
+        updatedAt: new Date().toISOString()
+      };
+      await saveData(data);
+      console.log(`[geocode] saved cache ${cityName} ms=${Date.now() - start}`);
+    } catch (error) {
+      const message = isRateLimitError(error) ? rateLimitMessage() : error.message;
+      failures[cityName] = message;
+      console.log(`[geocode] failed ${cityName} ms=${Date.now() - start} error=${error.message}`);
+      if (isRateLimitError(error)) rateLimited = true;
+    }
   }
-  return geocodes;
+  return { geocodes, failures, rateLimited };
 }
 
 function mapCitiesFromGeocodes(orderedCities, geocodes) {
@@ -313,6 +411,7 @@ function mapCitiesFromGeocodes(orderedCities, geocodes) {
       enabled: city.enabled !== false,
       lng: geo?.lng,
       lat: geo?.lat,
+      geocode_error: geo ? "" : "坐标待计算",
       days: city.days || "",
       keywords: city.keywords || "",
       reason: city.reason || "",
@@ -326,19 +425,25 @@ function mapCitiesFromGeocodes(orderedCities, geocodes) {
   });
 }
 
-async function buildRouteMarkers(route, key) {
+async function buildRouteMarkersWithCache(route, key, data) {
   const orderedCities = normalizeCities(route.cities || []);
   const cachedCities = route.map?.cities_signature === routeCitiesSignature(route) ? route.map?.cities || [] : [];
-  const geocodes = await geocodeRouteCities(orderedCities, key, cachedCities);
+  const { geocodes, failures, rateLimited } = await geocodeRouteCities(orderedCities, key, data, cachedCities);
   const cities = mapCitiesFromGeocodes(orderedCities, geocodes);
+  for (const city of cities) {
+    if (failures[city.name]) city.geocode_error = failures[city.name];
+  }
+  const error = rateLimited
+    ? "请求过快，请稍后再试。已显示成功加载的城市。"
+    : Object.keys(failures).length ? "部分城市坐标暂时没有加载成功，已显示成功加载的城市。" : "";
   return {
     cities,
     segments: displaySegmentsForCities(orderedCities, cities, route.map?.segments || []),
     total_distance_km: route.map?.total_distance_km ?? null,
     cities_signature: routeCitiesSignature(route),
     distance_signature: route.map?.distance_signature || null,
-    updated_at: route.map?.updated_at || new Date().toISOString(),
-    error: ""
+    updated_at: new Date().toISOString(),
+    error
   };
 }
 
@@ -362,20 +467,6 @@ function displaySegmentsForCities(orderedCities, mapCities, existingSegments = [
   });
 }
 
-async function mapLimit(items, limit, worker) {
-  const results = new Array(items.length);
-  let index = 0;
-  async function runner() {
-    while (index < items.length) {
-      const current = index;
-      index += 1;
-      results[current] = await worker(items[current], current);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runner));
-  return results;
-}
-
 function simplifiedSegmentPath(from, to, geocodes) {
   const origin = geocodes.get(from);
   const destination = geocodes.get(to);
@@ -384,10 +475,11 @@ function simplifiedSegmentPath(from, to, geocodes) {
 }
 
 function segmentFromCache(from, to, cached, geocodes) {
+  const distance = Number(cached.distance_km);
   return {
     from,
     to,
-    distance_km: cached.distance_km ?? null,
+    distance_km: Number.isFinite(distance) ? distance : null,
     duration_hours: cached.duration_hours ?? null,
     navigation_url: cached.navigation_url || "",
     path: cached.path?.length ? cached.path : simplifiedSegmentPath(from, to, geocodes),
@@ -398,7 +490,7 @@ function segmentFromCache(from, to, cached, geocodes) {
 
 function failedSegment(from, to, error, geocodes) {
   const message = isRateLimitError(error)
-    ? "高德接口限流，请稍后重试"
+    ? rateLimitMessage()
     : error.message;
   return {
     from,
@@ -413,30 +505,43 @@ function failedSegment(from, to, error, geocodes) {
   };
 }
 
-async function buildRouteDistance(route, key, distanceCache = {}) {
+async function buildRouteDistance(route, key, data) {
   const orderedCities = normalizeCities(route.cities || []);
   const enabledCities = orderedCities.filter((city) => city.enabled !== false && city.name);
   const cachedCities = route.map?.cities_signature === routeCitiesSignature(route) ? route.map?.cities || [] : [];
-  const geocodes = await geocodeRouteCities(orderedCities, key, cachedCities);
+  data.distanceCache = data.distanceCache || {};
+  const { geocodes, failures: geocodeFailures, rateLimited: geocodeRateLimited } = await geocodeRouteCities(enabledCities, key, data, cachedCities);
   const segmentPairs = [];
   for (let i = 0; i < enabledCities.length - 1; i += 1) {
     segmentPairs.push([enabledCities[i].name, enabledCities[i + 1].name]);
   }
   const segments = [];
   let hasFailures = false;
+  let rateLimited = geocodeRateLimited;
   for (const [from, to] of segmentPairs) {
     const cacheKey = segmentCacheKey(from, to);
-    const cached = distanceCache[cacheKey];
-    if (cached?.distance_km) {
+    const cached = data.distanceCache[cacheKey];
+    if (Number.isFinite(Number(cached?.distance_km))) {
       console.log(`[distance] segment cache hit ${from} -> ${to}`);
       segments.push(segmentFromCache(from, to, cached, geocodes));
+      continue;
+    }
+    if (rateLimited) {
+      hasFailures = true;
+      segments.push(failedSegment(from, to, new Error(rateLimitMessage()), geocodes));
+      continue;
+    }
+    if (!geocodes.has(from) || !geocodes.has(to)) {
+      hasFailures = true;
+      const reason = geocodeFailures[from] || geocodeFailures[to] || `缺少城市坐标：${from} 到 ${to}`;
+      segments.push(failedSegment(from, to, new Error(reason), geocodes));
       continue;
     }
     const start = Date.now();
     console.log(`[distance] segment start ${from} -> ${to}`);
     try {
       const segment = await drivingDistance(from, to, key, geocodes);
-      distanceCache[cacheKey] = {
+      data.distanceCache[cacheKey] = {
         from,
         to,
         distance_km: segment.distance_km,
@@ -445,16 +550,22 @@ async function buildRouteDistance(route, key, distanceCache = {}) {
         path: segment.path || [],
         updatedAt: segment.updatedAt || new Date().toISOString()
       };
+      await saveData(data);
       console.log(`[distance] segment done ${from} -> ${to} ms=${Date.now() - start}`);
       segments.push(segment);
     } catch (error) {
       console.log(`[distance] segment failed ${from} -> ${to} ms=${Date.now() - start} error=${error.message}`);
       hasFailures = true;
+      if (isRateLimitError(error)) rateLimited = true;
       segments.push(failedSegment(from, to, error, geocodes));
     }
-    await sleep(450);
   }
-  const totalDistanceKm = Math.round(segments.reduce((sum, segment) => sum + segment.distance_km, 0) * 10) / 10;
+  const successfulDistances = segments
+    .map((segment) => Number(segment.distance_km))
+    .filter(Number.isFinite);
+  const totalDistanceKm = successfulDistances.length
+    ? Math.round(successfulDistances.reduce((sum, distance) => sum + distance, 0) * 10) / 10
+    : null;
   return {
     cities: mapCitiesFromGeocodes(orderedCities, geocodes),
     segments,
@@ -462,7 +573,7 @@ async function buildRouteDistance(route, key, distanceCache = {}) {
     cities_signature: routeCitiesSignature(route),
     distance_signature: hasFailures ? null : routeCitiesSignature(route),
     updated_at: new Date().toISOString(),
-    error: hasFailures ? "高德接口请求过快，请稍后再试。已保留已有计算结果。" : ""
+    error: rateLimited ? "请求过快，请稍后再试。已保留已有计算结果。" : (hasFailures ? "部分路段暂时没有计算成功，已保留已有计算结果。" : "")
   };
 }
 
@@ -917,20 +1028,17 @@ const server = http.createServer(async (req, res) => {
       if (!route) return send(res, 404, { error: "路线不存在" });
       if (!AMAP_WEB_SERVICE_KEY) return send(res, 400, { error: "后端缺少 AMAP_WEB_SERVICE_KEY 环境变量" });
       const signature = routeCitiesSignature(route);
-      if (route.map?.distance_signature === signature && Array.isArray(route.map?.segments)) {
+      if (route.map?.distance_signature === signature && Array.isArray(route.map?.segments) && hasCompleteDistanceSegments(route)) {
         console.log(`[distance] cache hit route=${route.id}`);
         return send(res, 200, publicDistance(route.map));
       }
       const startedAt = Date.now();
       console.log(`[distance] start route=${route.id} ${new Date(startedAt).toISOString()}`);
       try {
-        const ordered = normalizeCities(route.cities || []).filter((city) => city.enabled !== false);
-        for (let i = 0; i < ordered.length - 1; i += 1) {
-          const from = ordered[i].name;
-          const to = ordered[i + 1].name;
+        for (const [from, to] of enabledSegmentPairs(route)) {
           console.log(`[distance] segment queued ${from} -> ${to}`);
         }
-        route.map = await buildRouteDistance(route, AMAP_WEB_SERVICE_KEY, data.distanceCache);
+        route.map = await buildRouteDistance(route, AMAP_WEB_SERVICE_KEY, data);
         route.updatedAt = new Date().toISOString();
         await saveData(data);
         console.log(`[distance] done route=${route.id} totalMs=${Date.now() - startedAt}`);
@@ -946,12 +1054,12 @@ const server = http.createServer(async (req, res) => {
       const route = data.routes.find((entry) => entry.id === mapDataMatch[1]);
       if (!route) return send(res, 404, { error: "路线不存在" });
       const signature = routeCitiesSignature(route);
-      if (!route.map?.cities?.length || route.map?.cities_signature !== signature) {
+      if (!route.map?.cities?.length || route.map?.cities_signature !== signature || !hasCompleteMapCities(route)) {
         if (!AMAP_WEB_SERVICE_KEY) return send(res, 400, { error: "后端缺少 AMAP_WEB_SERVICE_KEY 环境变量" });
         const startedAt = Date.now();
         console.log(`[map-data] start route=${route.id} ${new Date(startedAt).toISOString()}`);
         try {
-          route.map = await buildRouteMarkers(route, AMAP_WEB_SERVICE_KEY);
+          route.map = await buildRouteMarkersWithCache(route, AMAP_WEB_SERVICE_KEY, data);
           route.updatedAt = new Date().toISOString();
           await saveData(data);
           console.log(`[map-data] done route=${route.id} totalMs=${Date.now() - startedAt}`);
@@ -964,7 +1072,8 @@ const server = http.createServer(async (req, res) => {
         cities: route.map.cities || [],
         segments: displaySegmentsForCities(normalizeCities(route.cities || []), route.map.cities || [], route.map.segments || []),
         total_distance_km: route.map.total_distance_km ?? null,
-        updated_at: route.map.updated_at || null
+        updated_at: route.map.updated_at || null,
+        error: route.map.error || ""
       });
     }
 
