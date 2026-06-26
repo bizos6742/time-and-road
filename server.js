@@ -13,11 +13,22 @@ const PORT = Number(process.env.PORT || 4173);
 const AMAP_WEB_SERVICE_KEY = process.env.AMAP_WEB_SERVICE_KEY || "";
 const AMAP_JS_API_KEY = process.env.AMAP_JS_API_KEY || "";
 const AMAP_SECURITY_JS_CODE = process.env.AMAP_SECURITY_JS_CODE || "";
-const AMAP_REQUEST_INTERVAL_MS = 420;
+const AMAP_REQUEST_INTERVAL_MS = 500;
 let amapScriptCache = "";
 let amapScriptPromise = null;
 let amapWebQueue = Promise.resolve();
 let lastAmapWebRequestAt = 0;
+let amapRequestSeq = 0;
+const amapWebStats = {
+  total: 0,
+  byType: {},
+  bySource: {},
+  recent: []
+};
+const inFlightGeocodes = new Map();
+const inFlightDirections = new Map();
+const inFlightMapData = new Map();
+const inFlightDistance = new Map();
 
 const emptyData = {
   settings: { volcanoKey: "" },
@@ -28,6 +39,10 @@ const emptyData = {
 
 function id(prefix = "id") {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function requestId() {
+  return id("req");
 }
 
 async function ensureData() {
@@ -289,56 +304,124 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function amapWebJson(url, label) {
+function amapContextLabel(context = {}) {
+  return [
+    context.source || "unknown",
+    context.routeId ? `route=${context.routeId}` : "",
+    context.requestId ? `request=${context.requestId}` : "",
+    context.type || "",
+    context.target || ""
+  ].filter(Boolean).join(" ");
+}
+
+function recordAmapRequest(context, queuedAt, startedAt) {
+  const type = context.type || "unknown";
+  const source = context.source || "unknown";
+  amapWebStats.total += 1;
+  amapWebStats.byType[type] = (amapWebStats.byType[type] || 0) + 1;
+  amapWebStats.bySource[source] = (amapWebStats.bySource[source] || 0) + 1;
+  const entry = {
+    seq: amapRequestSeq,
+    at: new Date(startedAt).toISOString(),
+    type,
+    source,
+    routeId: context.routeId || "",
+    requestId: context.requestId || "",
+    target: context.target || "",
+    queuedMs: startedAt - queuedAt
+  };
+  amapWebStats.recent.unshift(entry);
+  amapWebStats.recent = amapWebStats.recent.slice(0, 80);
+  return entry;
+}
+
+function amapWebJson(url, context = {}) {
+  const queuedAt = Date.now();
   const run = amapWebQueue.then(async () => {
     const elapsed = Date.now() - lastAmapWebRequestAt;
     if (elapsed < AMAP_REQUEST_INTERVAL_MS) await sleep(AMAP_REQUEST_INTERVAL_MS - elapsed);
+    const startedAt = Date.now();
     lastAmapWebRequestAt = Date.now();
-    console.log(`[amap] ${label}`);
-    return httpsJson(url);
+    amapRequestSeq += 1;
+    const entry = recordAmapRequest(context, queuedAt, startedAt);
+    console.log(`[amap-web] #${entry.seq} start ${amapContextLabel(context)} queuedMs=${entry.queuedMs} total=${amapWebStats.total}`);
+    try {
+      const data = await httpsJson(url);
+      console.log(`[amap-web] #${entry.seq} done status=${data.status || ""} info=${data.info || ""} infocode=${data.infocode || ""}`);
+      return data;
+    } catch (error) {
+      console.log(`[amap-web] #${entry.seq} failed error=${error.message}`);
+      throw error;
+    }
   });
   amapWebQueue = run.catch(() => {});
   return run;
 }
 
-async function geocodeCity(city, key) {
-  const url = `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(key)}&address=${encodeURIComponent(city)}`;
-  const data = await amapWebJson(url, `geocode ${city}`);
-  if (data.status && data.status !== "1") {
-    throw new Error(`城市地理编码失败：${city}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
+async function geocodeCity(city, key, context = {}) {
+  const inflightKey = city;
+  if (inFlightGeocodes.has(inflightKey)) {
+    console.log(`[amap-dedupe] join geocode city=${city} ${amapContextLabel(context)}`);
+    return inFlightGeocodes.get(inflightKey);
   }
-  const location = data.geocodes?.[0]?.location;
-  if (!location) throw new Error(`没有找到城市坐标：${city}`);
-  const [lng, lat] = location.split(",").map(Number);
-  return { location, lng, lat };
+  const url = `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(key)}&address=${encodeURIComponent(city)}`;
+  const promise = (async () => {
+    const data = await amapWebJson(url, { ...context, type: "geocode", target: city });
+    if (data.status && data.status !== "1") {
+      throw new Error(`城市地理编码失败：${city}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
+    }
+    const location = data.geocodes?.[0]?.location;
+    if (!location) throw new Error(`没有找到城市坐标：${city}`);
+    const [lng, lat] = location.split(",").map(Number);
+    return { location, lng, lat };
+  })();
+  inFlightGeocodes.set(inflightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlightGeocodes.delete(inflightKey);
+  }
 }
 
-async function drivingDistance(from, to, key, geocodes = null) {
+async function drivingDistance(from, to, key, geocodes = null, context = {}) {
   const origin = geocodes?.get(from);
   const destination = geocodes?.get(to);
   if (!origin || !destination) throw new Error(`缺少城市坐标：${from} 到 ${to}`);
-  const url = `https://restapi.amap.com/v3/direction/driving?key=${encodeURIComponent(key)}&origin=${origin.location}&destination=${destination.location}`;
-  const data = await amapWebJson(url, `direction ${from} -> ${to}`);
-  if (data.status && data.status !== "1") {
-    throw new Error(`direction 接口失败：${from} 到 ${to}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
+  const inflightKey = segmentCacheKey(from, to);
+  if (inFlightDirections.has(inflightKey)) {
+    console.log(`[amap-dedupe] join direction ${from} -> ${to} ${amapContextLabel(context)}`);
+    return inFlightDirections.get(inflightKey);
   }
-  const path = data.route?.paths?.[0];
-  if (!path?.distance) throw new Error(`没有算出距离：${from} 到 ${to}`);
-  const polyline = (path.steps || [])
-    .flatMap((step) => String(step.polyline || "").split(";"))
-    .filter(Boolean)
-    .map((point) => point.split(",").map(Number))
-    .filter((point) => point.length === 2 && point.every(Number.isFinite));
+  const url = `https://restapi.amap.com/v3/direction/driving?key=${encodeURIComponent(key)}&origin=${origin.location}&destination=${destination.location}`;
+  const promise = (async () => {
+    const data = await amapWebJson(url, { ...context, type: "direction", target: `${from} -> ${to}` });
+    if (data.status && data.status !== "1") {
+      throw new Error(`direction 接口失败：${from} 到 ${to}，${data.info || "未知错误"}（${data.infocode || "无错误码"}）`);
+    }
+    const path = data.route?.paths?.[0];
+    if (!path?.distance) throw new Error(`没有算出距离：${from} 到 ${to}`);
+    const polyline = (path.steps || [])
+      .flatMap((step) => String(step.polyline || "").split(";"))
+      .filter(Boolean)
+      .map((point) => point.split(",").map(Number))
+      .filter((point) => point.length === 2 && point.every(Number.isFinite));
 
-  return {
-    from,
-    to,
-    distance_km: Math.round(Number(path.distance) / 100) / 10,
-    duration_hours: path.duration ? Math.round(Number(path.duration) / 360) / 10 : null,
-    navigation_url: `https://uri.amap.com/navigation?from=${encodeURIComponent(`${origin.location},${from}`)}&to=${encodeURIComponent(`${destination.location},${to}`)}&mode=car&policy=1`,
-    path: polyline,
-    updatedAt: new Date().toISOString()
-  };
+    return {
+      from,
+      to,
+      distance_km: Math.round(Number(path.distance) / 100) / 10,
+      duration_hours: path.duration ? Math.round(Number(path.duration) / 360) / 10 : null,
+      navigation_url: `https://uri.amap.com/navigation?from=${encodeURIComponent(`${origin.location},${from}`)}&to=${encodeURIComponent(`${destination.location},${to}`)}&mode=car&policy=1`,
+      path: polyline,
+      updatedAt: new Date().toISOString()
+    };
+  })();
+  inFlightDirections.set(inflightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlightDirections.delete(inflightKey);
+  }
 }
 
 function cachedGeocode(cityName, data, cachedCities = []) {
@@ -363,7 +446,7 @@ function cachedGeocode(cityName, data, cachedCities = []) {
   return null;
 }
 
-async function geocodeRouteCities(orderedCities, key, data, cachedCities = []) {
+async function geocodeRouteCities(orderedCities, key, data, cachedCities = [], context = {}) {
   const geocodes = new Map();
   const failures = {};
   let rateLimited = false;
@@ -381,7 +464,7 @@ async function geocodeRouteCities(orderedCities, key, data, cachedCities = []) {
     }
     const start = Date.now();
     try {
-      const geo = await geocodeCity(cityName, key);
+      const geo = await geocodeCity(cityName, key, context);
       geocodes.set(cityName, geo);
       data.geocodeCache[cityName] = {
         lng: geo.lng,
@@ -425,10 +508,10 @@ function mapCitiesFromGeocodes(orderedCities, geocodes) {
   });
 }
 
-async function buildRouteMarkersWithCache(route, key, data) {
+async function buildRouteMarkersWithCache(route, key, data, context = {}) {
   const orderedCities = normalizeCities(route.cities || []);
   const cachedCities = route.map?.cities_signature === routeCitiesSignature(route) ? route.map?.cities || [] : [];
-  const { geocodes, failures, rateLimited } = await geocodeRouteCities(orderedCities, key, data, cachedCities);
+  const { geocodes, failures, rateLimited } = await geocodeRouteCities(orderedCities, key, data, cachedCities, context);
   const cities = mapCitiesFromGeocodes(orderedCities, geocodes);
   for (const city of cities) {
     if (failures[city.name]) city.geocode_error = failures[city.name];
@@ -505,12 +588,12 @@ function failedSegment(from, to, error, geocodes) {
   };
 }
 
-async function buildRouteDistance(route, key, data) {
+async function buildRouteDistance(route, key, data, context = {}) {
   const orderedCities = normalizeCities(route.cities || []);
   const enabledCities = orderedCities.filter((city) => city.enabled !== false && city.name);
   const cachedCities = route.map?.cities_signature === routeCitiesSignature(route) ? route.map?.cities || [] : [];
   data.distanceCache = data.distanceCache || {};
-  const { geocodes, failures: geocodeFailures, rateLimited: geocodeRateLimited } = await geocodeRouteCities(enabledCities, key, data, cachedCities);
+  const { geocodes, failures: geocodeFailures, rateLimited: geocodeRateLimited } = await geocodeRouteCities(enabledCities, key, data, cachedCities, context);
   const segmentPairs = [];
   for (let i = 0; i < enabledCities.length - 1; i += 1) {
     segmentPairs.push([enabledCities[i].name, enabledCities[i + 1].name]);
@@ -540,7 +623,7 @@ async function buildRouteDistance(route, key, data) {
     const start = Date.now();
     console.log(`[distance] segment start ${from} -> ${to}`);
     try {
-      const segment = await drivingDistance(from, to, key, geocodes);
+      const segment = await drivingDistance(from, to, key, geocodes, context);
       data.distanceCache[cacheKey] = {
         from,
         to,
@@ -1032,19 +1115,33 @@ const server = http.createServer(async (req, res) => {
         console.log(`[distance] cache hit route=${route.id}`);
         return send(res, 200, publicDistance(route.map));
       }
+      if (inFlightDistance.has(route.id)) {
+        console.log(`[distance] join in-flight route=${route.id}`);
+        const map = await inFlightDistance.get(route.id);
+        return send(res, 200, publicDistance(map));
+      }
       const startedAt = Date.now();
-      console.log(`[distance] start route=${route.id} ${new Date(startedAt).toISOString()}`);
+      const reqId = requestId();
+      const context = { source: "GET /api/routes/:routeId/distance", routeId: route.id, requestId: reqId };
+      console.log(`[distance] start route=${route.id} request=${reqId} ${new Date(startedAt).toISOString()}`);
       try {
         for (const [from, to] of enabledSegmentPairs(route)) {
-          console.log(`[distance] segment queued ${from} -> ${to}`);
+          console.log(`[distance] segment queued route=${route.id} request=${reqId} ${from} -> ${to}`);
         }
-        route.map = await buildRouteDistance(route, AMAP_WEB_SERVICE_KEY, data);
-        route.updatedAt = new Date().toISOString();
-        await saveData(data);
+        const promise = (async () => {
+          route.map = await buildRouteDistance(route, AMAP_WEB_SERVICE_KEY, data, context);
+          route.updatedAt = new Date().toISOString();
+          await saveData(data);
+          return route.map;
+        })();
+        inFlightDistance.set(route.id, promise);
+        route.map = await promise;
         console.log(`[distance] done route=${route.id} totalMs=${Date.now() - startedAt}`);
       } catch (error) {
         console.log(`[distance] failed route=${route.id} totalMs=${Date.now() - startedAt} error=${error.message}`);
         return send(res, 500, { error: error.message });
+      } finally {
+        inFlightDistance.delete(route.id);
       }
       return send(res, 200, publicDistance(route.map));
     }
@@ -1056,16 +1153,36 @@ const server = http.createServer(async (req, res) => {
       const signature = routeCitiesSignature(route);
       if (!route.map?.cities?.length || route.map?.cities_signature !== signature || !hasCompleteMapCities(route)) {
         if (!AMAP_WEB_SERVICE_KEY) return send(res, 400, { error: "后端缺少 AMAP_WEB_SERVICE_KEY 环境变量" });
+        if (inFlightMapData.has(route.id)) {
+          console.log(`[map-data] join in-flight route=${route.id}`);
+          const map = await inFlightMapData.get(route.id);
+          return send(res, 200, {
+            cities: map.cities || [],
+            segments: displaySegmentsForCities(normalizeCities(route.cities || []), map.cities || [], map.segments || []),
+            total_distance_km: map.total_distance_km ?? null,
+            updated_at: map.updated_at || null,
+            error: map.error || ""
+          });
+        }
         const startedAt = Date.now();
-        console.log(`[map-data] start route=${route.id} ${new Date(startedAt).toISOString()}`);
+        const reqId = requestId();
+        const context = { source: "GET /api/routes/:routeId/map-data", routeId: route.id, requestId: reqId };
+        console.log(`[map-data] start route=${route.id} request=${reqId} ${new Date(startedAt).toISOString()}`);
         try {
-          route.map = await buildRouteMarkersWithCache(route, AMAP_WEB_SERVICE_KEY, data);
-          route.updatedAt = new Date().toISOString();
-          await saveData(data);
+          const promise = (async () => {
+            route.map = await buildRouteMarkersWithCache(route, AMAP_WEB_SERVICE_KEY, data, context);
+            route.updatedAt = new Date().toISOString();
+            await saveData(data);
+            return route.map;
+          })();
+          inFlightMapData.set(route.id, promise);
+          route.map = await promise;
           console.log(`[map-data] done route=${route.id} totalMs=${Date.now() - startedAt}`);
         } catch (error) {
           console.log(`[map-data] failed route=${route.id} totalMs=${Date.now() - startedAt} error=${error.message}`);
           return send(res, 500, { error: error.message });
+        } finally {
+          inFlightMapData.delete(route.id);
         }
       }
       return send(res, 200, {
@@ -1074,6 +1191,18 @@ const server = http.createServer(async (req, res) => {
         total_distance_km: route.map.total_distance_km ?? null,
         updated_at: route.map.updated_at || null,
         error: route.map.error || ""
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/amap-debug") {
+      return send(res, 200, {
+        stats: amapWebStats,
+        inFlight: {
+          geocodes: [...inFlightGeocodes.keys()],
+          directions: [...inFlightDirections.keys()],
+          mapDataRoutes: [...inFlightMapData.keys()],
+          distanceRoutes: [...inFlightDistance.keys()]
+        }
       });
     }
 

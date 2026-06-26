@@ -189,6 +189,7 @@ async function calculateDistance(routeId, message = "高德距离已更新。", 
   state.message = "正在计算高德距离...";
   render();
   try {
+    console.log(`[frontend] GET /api/routes/${routeId}/distance`);
     await api(`/api/routes/${routeId}/distance`);
     const fresh = await api("/api/data");
     state.data = fresh;
@@ -503,6 +504,7 @@ async function ensureMapData(route) {
   if (state.mapLoading[route.id]) return null;
   state.mapLoading[route.id] = true;
   try {
+    console.log(`[frontend] GET /api/routes/${route.id}/map-data`);
     const data = await api(`/api/routes/${route.id}/map-data`);
     state.mapData[route.id] = data;
     delete state.mapErrors[route.id];
