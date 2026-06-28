@@ -8,6 +8,9 @@ let state = {
   adminPassword: "",
   selectedRouteId: null,
   selectedCityId: null,
+  routeFormRouteId: null,
+  routeForm: null,
+  routeFormDirty: false,
   captureText: "",
   extractText: "",
   extractCity: "",
@@ -49,6 +52,7 @@ async function load() {
   state.adminChecked = true;
   state.data = await api("/api/data");
   if (!state.selectedRouteId && state.data.routes[0]) state.selectedRouteId = state.data.routes[0].id;
+  syncRouteFormForSelection({ force: !state.routeFormDirty });
   render();
 }
 
@@ -58,6 +62,64 @@ function canEdit() {
 
 function selectedRoute() {
   return state.data.routes.find((route) => route.id === state.selectedRouteId) || null;
+}
+
+function routeToForm(route) {
+  return {
+    id: route?.id || "",
+    name: route?.name || "",
+    start: route?.start || "",
+    end: route?.end || "",
+    totalDays: route?.totalDays || "",
+    bestSeason: route?.bestSeason || "",
+    tags: Array.isArray(route?.tags) ? route.tags.join("，") : (route?.tags || ""),
+    notes: route?.notes || "",
+    folderId: route?.folderId || "folder_uncategorized"
+  };
+}
+
+function formToRouteFields(form) {
+  return {
+    name: form?.name || "",
+    start: form?.start || "",
+    end: form?.end || "",
+    totalDays: form?.totalDays || "",
+    bestSeason: form?.bestSeason || "",
+    tags: String(form?.tags || "").split(/[，,]/).map((tag) => tag.trim()).filter(Boolean),
+    notes: form?.notes || "",
+    folderId: form?.folderId || "folder_uncategorized"
+  };
+}
+
+function syncRouteFormForSelection({ force = false } = {}) {
+  const route = selectedRoute();
+  if (!route) {
+    state.routeFormRouteId = null;
+    state.routeForm = null;
+    state.routeFormDirty = false;
+    return null;
+  }
+  if (force || state.routeFormRouteId !== route.id || !state.routeForm) {
+    state.routeFormRouteId = route.id;
+    state.routeForm = routeToForm(route);
+    state.routeFormDirty = false;
+  }
+  return state.routeForm;
+}
+
+function currentRouteForm(route = selectedRoute()) {
+  if (!route) return null;
+  if (state.routeFormRouteId !== route.id || !state.routeForm) {
+    state.routeFormRouteId = route.id;
+    state.routeForm = routeToForm(route);
+    state.routeFormDirty = false;
+  }
+  return state.routeForm;
+}
+
+function applyRouteForm(route) {
+  const form = currentRouteForm(route);
+  return { ...route, ...formToRouteFields(form) };
 }
 
 function selectedCity() {
@@ -129,6 +191,7 @@ function syncCachedMapCities(route) {
 }
 
 async function saveRouteAndRecalculate(route, message, keepCityId = null) {
+  route = applyRouteForm(route);
   normalizeRouteOrder(route);
   route.map = { segments: [], total_distance_km: null, updated_at: null, error: "" };
   delete state.mapErrors[route.id];
@@ -136,29 +199,40 @@ async function saveRouteAndRecalculate(route, message, keepCityId = null) {
   delete state.mapData[route.id];
   syncCachedMapCities(route);
   const updated = await api(`/api/routes/${route.id}`, { method: "PUT", body: route });
-  state.data.routes = state.data.routes.map((entry) => entry.id === updated.id ? updated : entry);
-  state.selectedRouteId = updated.id;
+  const merged = mergeCityOnlyRouteUpdate(route, updated);
+  replaceRoute(merged);
   state.selectedCityId = keepCityId;
-  if (state.mapCityId && !updated.cities.some((city) => city.id === state.mapCityId)) state.mapCityId = null;
-  scheduleDistanceCalculation(updated.id, message, keepCityId);
+  if (state.mapCityId && !merged.cities.some((city) => city.id === state.mapCityId)) state.mapCityId = null;
+  markDistanceNeedsUpdate(merged.id, message);
 }
 
-function replaceRoute(route) {
+function replaceRoute(route, { syncForm = false } = {}) {
   state.data.routes = state.data.routes.map((entry) => entry.id === route.id ? route : entry);
   state.selectedRouteId = route.id;
+  if (syncForm || (state.routeFormRouteId === route.id && !state.routeFormDirty)) {
+    state.routeFormRouteId = route.id;
+    state.routeForm = routeToForm(route);
+    state.routeFormDirty = false;
+  }
 }
 
 function mergeCityOnlyRouteUpdate(previousRoute, updatedRoute) {
   if (!previousRoute) return updatedRoute;
+  const preserved = state.routeFormRouteId === previousRoute.id && state.routeForm
+    ? formToRouteFields(state.routeForm)
+    : {
+        name: previousRoute.name,
+        start: previousRoute.start,
+        end: previousRoute.end,
+        totalDays: previousRoute.totalDays,
+        bestSeason: previousRoute.bestSeason,
+        tags: previousRoute.tags,
+        notes: previousRoute.notes,
+        folderId: previousRoute.folderId
+      };
   return {
     ...updatedRoute,
-    name: previousRoute.name,
-    start: previousRoute.start,
-    end: previousRoute.end,
-    totalDays: previousRoute.totalDays,
-    bestSeason: previousRoute.bestSeason,
-    tags: previousRoute.tags,
-    notes: previousRoute.notes,
+    ...preserved,
     sourceText: previousRoute.sourceText,
     cities: updatedRoute.cities || []
   };
@@ -176,19 +250,16 @@ async function applyServerRouteChange(request, message, keepCityId = null) {
   delete state.mapData[route.id];
   delete state.mapErrors[route.id];
   delete state.distanceErrors[route.id];
-  scheduleDistanceCalculation(route.id, message, keepCityId);
+  markDistanceNeedsUpdate(route.id, message);
   const latest = selectedRoute();
   if (latest) printCityOrders("前端当前 cities:", latest);
 }
 
-function scheduleDistanceCalculation(routeId, message, keepCityId = state.selectedCityId) {
+function markDistanceNeedsUpdate(routeId, message) {
   if (distanceTimers[routeId]) clearTimeout(distanceTimers[routeId]);
-  state.message = `${message} 距离将在稍后更新。`;
+  delete distanceTimers[routeId];
+  state.message = `${message} 距离需要更新，可点击“计算距离”。`;
   render();
-  distanceTimers[routeId] = setTimeout(() => {
-    delete distanceTimers[routeId];
-    calculateDistance(routeId, message, keepCityId);
-  }, 2000);
 }
 
 async function calculateDistance(routeId, message = "高德距离已更新。", keepCityId = state.selectedCityId) {
@@ -207,6 +278,7 @@ async function calculateDistance(routeId, message = "高德距离已更新。", 
     const fresh = await api("/api/data");
     state.data = fresh;
     state.selectedRouteId = routeId;
+    syncRouteFormForSelection({ force: false });
     state.selectedCityId = keepCityId;
     delete state.mapData[routeId];
     delete state.mapErrors[routeId];
@@ -390,23 +462,24 @@ function homeView() {
 function routeView(route) {
   const cities = orderedCities(route);
   const editable = canEdit();
+  const form = editable ? currentRouteForm(route) : routeToForm(route);
   return `
     <section class="route-head">
-      <h2>${esc(route.name)}</h2>
+      <h2>${esc(form.name || route.name)}</h2>
       ${editable ? `
         <div class="field-row">
-          ${field("路线名称", "name", route.name)}
-          ${field("起点", "start", route.start)}
-          ${field("终点", "end", route.end)}
-          ${field("总天数", "totalDays", route.totalDays)}
+          ${field("路线名称", "name", form.name)}
+          ${field("起点", "start", form.start)}
+          ${field("终点", "end", form.end)}
+          ${field("总天数", "totalDays", form.totalDays)}
         </div>
         <div class="field-row">
-          ${field("最佳季节", "bestSeason", route.bestSeason)}
-          ${field("路线标签", "tags", (route.tags || []).join("，"))}
-          ${folderSelectField(route.folderId)}
+          ${field("最佳季节", "bestSeason", form.bestSeason)}
+          ${field("路线标签", "tags", form.tags)}
+          ${folderSelectField(form.folderId)}
           <div class="actions"><button data-action="save-route-edit">保存路线信息</button></div>
         </div>
-        <label class="label">总备注<textarea data-route-field="notes">${esc(route.notes || "")}</textarea></label>
+        <label class="label">总备注<textarea data-route-field="notes">${esc(form.notes || "")}</textarea></label>
       ` : `
         <div class="stats">
           <span class="chip">${esc(route.start || "起点未填")} → ${esc(route.end || "终点未填")}</span>
@@ -878,12 +951,7 @@ function collection(title, key, items = [], fields) {
 }
 
 function collectRouteEdits(route) {
-  const updates = structuredClone(route);
-  document.querySelectorAll("[data-route-field]").forEach((input) => {
-    const key = input.dataset.routeField;
-    updates[key] = key === "tags" ? input.value.split(/[，,]/).map((tag) => tag.trim()).filter(Boolean) : input.value;
-  });
-  return updates;
+  return applyRouteForm(structuredClone(route));
 }
 
 function updateCurrentRouteField(input) {
@@ -891,9 +959,9 @@ function updateCurrentRouteField(input) {
   if (!route) return;
   const key = input.dataset.routeField;
   if (!key) return;
-  route[key] = key === "tags"
-    ? input.value.split(/[，,]/).map((tag) => tag.trim()).filter(Boolean)
-    : input.value;
+  const form = currentRouteForm(route);
+  form[key] = input.value;
+  state.routeFormDirty = true;
 }
 
 function collectCityEdits(city) {
@@ -992,7 +1060,7 @@ app.addEventListener("drop", async (event) => {
   try {
     const updated = { ...route, folderId: folder.dataset.folderDrop };
     const saved = await api(`/api/routes/${route.id}`, { method: "PUT", body: updated });
-    replaceRoute(saved);
+    replaceRoute(saved, { syncForm: state.routeFormRouteId === saved.id && !state.routeFormDirty });
     state.message = "路线已移动到文件夹。";
     render();
   } catch (error) {
@@ -1088,6 +1156,7 @@ app.addEventListener("click", async (event) => {
         state.selectedCityId = null;
         state.mapCityId = null;
         state.mapEditingCityId = null;
+        syncRouteFormForSelection({ force: true });
       }
       delete state.mapData[routeId];
       delete state.mapErrors[routeId];
@@ -1101,6 +1170,7 @@ app.addEventListener("click", async (event) => {
     } else if (routeButton) {
       state.selectedRouteId = routeButton.dataset.route;
       state.selectedCityId = null;
+      syncRouteFormForSelection({ force: true });
       state.message = "";
       render();
     } else if (cityButton) {
@@ -1114,6 +1184,7 @@ app.addEventListener("click", async (event) => {
     } else if (action === "home") {
       state.selectedRouteId = null;
       state.selectedCityId = null;
+      syncRouteFormForSelection({ force: true });
       render();
     } else if (action === "add-folder") {
       const name = String(state.newFolderName || "").trim();
@@ -1148,16 +1219,14 @@ app.addEventListener("click", async (event) => {
       const route = await api("/api/routes", { method: "POST", body: { text: state.captureText } });
       await load();
       state.selectedRouteId = route.id;
+      syncRouteFormForSelection({ force: true });
       state.message = "已保存这条路线。";
       render();
     } else if (action === "save-route-edit") {
       const route = selectedRoute();
       const updated = await api(`/api/routes/${route.id}`, { method: "PUT", body: collectRouteEdits(route) });
-      replaceRoute(updated);
-      state.selectedRouteId = updated.id;
+      replaceRoute(updated, { syncForm: true });
       state.selectedCityId = null;
-      delete state.mapData[updated.id];
-      delete state.mapErrors[updated.id];
       state.message = "路线信息已保存。";
       render();
     } else if (action === "add-city") {
@@ -1249,6 +1318,7 @@ app.addEventListener("click", async (event) => {
       delete state.mapErrors[route.id];
       await load();
       state.selectedRouteId = route.id;
+      syncRouteFormForSelection({ force: true });
       state.extractCity = "";
       state.extractItems = [];
       state.message = "选中的整理结果已保存。";

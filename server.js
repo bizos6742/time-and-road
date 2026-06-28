@@ -199,8 +199,8 @@ function normalizeData(data) {
       delete city.links;
       delete city.reminders;
     }
-    route.start = route.start || route.cities[0]?.name || "";
-    route.end = route.end || route.cities.at(-1)?.name || "";
+    if (route.start === undefined || route.start === null) route.start = "";
+    if (route.end === undefined || route.end === null) route.end = "";
     for (const mapCity of route.map?.cities || []) {
       if (!data.geocodeCache[mapCity.name] && hasValidCoordinate(mapCity)) {
         data.geocodeCache[mapCity.name] = {
