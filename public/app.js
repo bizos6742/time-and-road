@@ -2,6 +2,10 @@ const app = document.querySelector("#app");
 
 let state = {
   data: { settings: {}, routes: [] },
+  isAdminPath: window.location.pathname === "/admin",
+  adminAuthenticated: false,
+  adminChecked: false,
+  adminPassword: "",
   selectedRouteId: null,
   selectedCityId: null,
   captureText: "",
@@ -38,9 +42,18 @@ async function api(path, options = {}) {
 }
 
 async function load() {
+  if (state.isAdminPath) {
+    const session = await api("/api/admin/session");
+    state.adminAuthenticated = Boolean(session.authenticated);
+  }
+  state.adminChecked = true;
   state.data = await api("/api/data");
   if (!state.selectedRouteId && state.data.routes[0]) state.selectedRouteId = state.data.routes[0].id;
   render();
+}
+
+function canEdit() {
+  return state.isAdminPath && state.adminAuthenticated;
 }
 
 function selectedRoute() {
@@ -224,9 +237,77 @@ function itemCounts(city) {
   };
 }
 
+function orderedFolders() {
+  const folders = (state.data.folders || [])
+    .map((folder, index) => ({
+      ...folder,
+      sortOrder: Number.isFinite(Number(folder.sortOrder)) ? Number(folder.sortOrder) : index + 1,
+      _fallbackOrder: index + 1
+    }))
+    .sort((a, b) => (a.sortOrder - b.sortOrder) || (a._fallbackOrder - b._fallbackOrder));
+  if (!folders.some((folder) => folder.id === "folder_uncategorized")) {
+    folders.unshift({ id: "folder_uncategorized", name: "未分类", sortOrder: 0 });
+  }
+  return folders.map(({ _fallbackOrder, ...folder }) => folder);
+}
+
+function folderToolsView() {
+  return `
+    <div class="folder-tools">
+      <label class="label">新增文件夹<input data-field="newFolderName" placeholder="例如：长线自驾" /></label>
+      <button class="secondary" data-action="add-folder">新增文件夹</button>
+    </div>
+  `;
+}
+
+function routeDirectoryView() {
+  const folders = orderedFolders();
+  const routes = state.data.routes || [];
+  const editable = canEdit();
+  return `<div class="route-list">
+    ${folders.map((folder, index) => {
+      const folderRoutes = routes.filter((route) => (route.folderId || "folder_uncategorized") === folder.id);
+      if (!editable && !folderRoutes.length) return "";
+      return `
+        <div class="folder-block" data-folder-drop="${esc(folder.id)}">
+          <div class="folder-head">
+            ${editable && folder.id !== "folder_uncategorized" ? `<input class="folder-name-input" data-folder-name="${folder.id}" value="${esc(folder.name)}" />` : `<strong>📁 ${esc(folder.name)}</strong>`}
+            ${editable ? `
+              <div class="folder-actions">
+                <button class="pill-step" data-action="save-folder" data-folder-id="${folder.id}" ${folder.id === "folder_uncategorized" ? "disabled" : ""}>保存</button>
+                <button class="pill-step" data-action="move-folder" data-direction="up" data-folder-id="${folder.id}" ${index <= 1 || folder.id === "folder_uncategorized" ? "disabled" : ""}>↑</button>
+                <button class="pill-step" data-action="move-folder" data-direction="down" data-folder-id="${folder.id}" ${index === folders.length - 1 || folder.id === "folder_uncategorized" ? "disabled" : ""}>↓</button>
+                <button class="pill-step danger" data-action="delete-folder" data-folder-id="${folder.id}" ${folder.id === "folder_uncategorized" ? "disabled" : ""}>删除</button>
+              </div>
+            ` : ""}
+          </div>
+          ${folderRoutes.map((entry) => `
+            <div class="route-row" ${editable ? `draggable="true" data-drag-route-id="${entry.id}"` : ""}>
+              <button class="route-tab ${entry.id === state.selectedRouteId ? "active" : ""}" data-route="${entry.id}">
+                ${esc(entry.name)}
+                <small>${esc(entry.start || "起点未填")} → ${esc(entry.end || "终点未填")}</small>
+              </button>
+              ${editable ? `<button class="route-delete danger" data-action="delete-route" data-route-id="${entry.id}" aria-label="删除路线">删除</button>` : ""}
+            </div>
+          `).join("") || `<p class="muted">还没有路线。</p>`}
+        </div>
+      `;
+    }).join("") || `<p class="muted">还没有保存路线。</p>`}
+  </div>`;
+}
+
 function render() {
+  if (state.isAdminPath && !state.adminChecked) {
+    app.innerHTML = `<main class="main"><p class="muted">正在进入后台...</p></main>`;
+    return;
+  }
+  if (state.isAdminPath && !state.adminAuthenticated) {
+    app.innerHTML = adminLoginView();
+    return;
+  }
   const route = selectedRoute();
   const city = selectedCity();
+  const editable = canEdit();
   app.innerHTML = `
     <div class="shell">
       <aside class="sidebar">
@@ -234,19 +315,11 @@ function render() {
           <h1>Time and Road</h1>
           <p>时光与道路</p>
         </div>
-        <button class="secondary" data-action="home">记一处地方</button>
+        ${editable ? `<button class="secondary" data-action="home">新增路线</button>` : `<button class="secondary" data-action="show-list">浏览路线</button>`}
+        ${editable ? `<button class="secondary" data-action="logout-admin">退出后台</button>` : `<a class="admin-link" href="/admin">后台管理</a>`}
         <h2 class="section-title">旅行目录</h2>
-        <div class="route-list">
-          ${state.data.routes.map((entry) => `
-            <div class="route-row">
-              <button class="route-tab ${entry.id === state.selectedRouteId ? "active" : ""}" data-route="${entry.id}">
-                ${esc(entry.name)}
-                <small>${esc(entry.start || "起点未填")} → ${esc(entry.end || "终点未填")}</small>
-              </button>
-              <button class="route-delete danger" data-action="delete-route" data-route-id="${entry.id}" aria-label="删除路线">删除</button>
-            </div>
-          `).join("") || `<p class="muted">还没有保存路线。</p>`}
-        </div>
+        ${editable ? folderToolsView() : ""}
+        ${routeDirectoryView()}
       </aside>
       <main class="main">
         ${city ? cityView(route, city) : route ? routeView(route) : homeView()}
@@ -258,7 +331,38 @@ function render() {
   }
 }
 
+function adminLoginView() {
+  return `
+    <main class="main">
+      <section class="quick-capture">
+        <div class="home-kicker">Time and Road</div>
+        <div class="home-question">后台管理</div>
+        <div class="home-intro"><p>请输入管理员密码。</p></div>
+        <label class="label">密码<input type="password" data-field="adminPassword" value="${esc(state.adminPassword)}" /></label>
+        <div class="actions">
+          <button data-action="login-admin">进入后台</button>
+          <a class="link" href="/">返回前台</a>
+        </div>
+        <p class="toast">${esc(state.message)}</p>
+      </section>
+    </main>
+  `;
+}
+
 function homeView() {
+  if (!canEdit()) {
+    return `
+      <section class="quick-capture">
+        <div class="home-kicker">Time and Road</div>
+        <div class="home-question">路线目录</div>
+        <div class="home-intro">
+          <p>记录值得再次出发的地方。</p>
+          <p>这里是一个个人旅行资料库，普通访客可以浏览路线、城市、地图和笔记。</p>
+        </div>
+        <p class="toast">${esc(state.message)}</p>
+      </section>
+    `;
+  }
   return `
     <section class="quick-capture">
       <div class="home-kicker">Time and Road</div>
@@ -285,21 +389,32 @@ function homeView() {
 
 function routeView(route) {
   const cities = orderedCities(route);
+  const editable = canEdit();
   return `
     <section class="route-head">
       <h2>${esc(route.name)}</h2>
-      <div class="field-row">
-        ${field("路线名称", "name", route.name)}
-        ${field("起点", "start", route.start)}
-        ${field("终点", "end", route.end)}
-        ${field("总天数", "totalDays", route.totalDays)}
-      </div>
-      <div class="field-row">
-        ${field("最佳季节", "bestSeason", route.bestSeason)}
-        ${field("路线标签", "tags", (route.tags || []).join("，"))}
-        <div class="actions"><button data-action="save-route-edit">保存路线信息</button></div>
-      </div>
-      <label class="label">总备注<textarea data-route-field="notes">${esc(route.notes || "")}</textarea></label>
+      ${editable ? `
+        <div class="field-row">
+          ${field("路线名称", "name", route.name)}
+          ${field("起点", "start", route.start)}
+          ${field("终点", "end", route.end)}
+          ${field("总天数", "totalDays", route.totalDays)}
+        </div>
+        <div class="field-row">
+          ${field("最佳季节", "bestSeason", route.bestSeason)}
+          ${field("路线标签", "tags", (route.tags || []).join("，"))}
+          ${folderSelectField(route.folderId)}
+          <div class="actions"><button data-action="save-route-edit">保存路线信息</button></div>
+        </div>
+        <label class="label">总备注<textarea data-route-field="notes">${esc(route.notes || "")}</textarea></label>
+      ` : `
+        <div class="stats">
+          <span class="chip">${esc(route.start || "起点未填")} → ${esc(route.end || "终点未填")}</span>
+          ${route.bestSeason ? `<span class="chip">${esc(route.bestSeason)}</span>` : ""}
+          ${(route.tags || []).map((tag) => `<span class="chip">${esc(tag)}</span>`).join("")}
+        </div>
+        ${route.notes ? `<p>${esc(route.notes)}</p>` : ""}
+      `}
     </section>
 
     <section class="card">
@@ -309,12 +424,14 @@ function routeView(route) {
           ${index ? `<span class="arrow">↓</span>` : ""}
           <span class="city-pill ${city.enabled === false ? "disabled" : ""} ${state.mapCityId === city.id ? "active" : ""}" title="点击定位，使用上移/下移调整顺序">
             <button class="city-pill-name" data-action="select-map-city" data-city-id="${city.id}">${esc(city.name)}</button>
-            <button class="pill-step" data-action="move-city" data-direction="up" data-city-id="${city.id}" ${index === 0 ? "disabled" : ""}>↑</button>
-            <button class="pill-step" data-action="move-city" data-direction="down" data-city-id="${city.id}" ${index === cities.length - 1 ? "disabled" : ""}>↓</button>
+            ${editable ? `
+              <button class="pill-step" data-action="move-city" data-direction="up" data-city-id="${city.id}" ${index === 0 ? "disabled" : ""}>↑</button>
+              <button class="pill-step" data-action="move-city" data-direction="down" data-city-id="${city.id}" ${index === cities.length - 1 ? "disabled" : ""}>↓</button>
+            ` : ""}
           </span>
         `).join("") || `<span class="muted">还没有城市。</span>`}
       </div>
-      <div class="city-insert">
+      ${editable ? `<div class="city-insert">
         <label class="label">添加城市<input data-field="newCityName" placeholder="城市名，例如：沧州" /></label>
         <label class="label">插入位置
           <select data-field="insertAfterCityId">
@@ -324,7 +441,7 @@ function routeView(route) {
           </select>
         </label>
         <div class="actions"><button data-action="add-city">添加城市</button></div>
-      </div>
+      </div>` : ""}
     </section>
 
     <section class="card">
@@ -338,7 +455,7 @@ function routeView(route) {
       ${state.routeViewMode === "map" ? routeMapView(route) : cityListView(route)}
     </section>
 
-    <section class="card">
+    ${editable ? `<section class="card">
       <h3 class="section-title">整理旅行资料</h3>
       <p class="hint">AI帮助整理旅行资料。AI负责整理，我负责决定。</p>
       <textarea data-field="extractText" placeholder="粘贴游记、点评或自己的零散记录">${esc(state.extractText)}</textarea>
@@ -347,7 +464,7 @@ function routeView(route) {
         ${state.extractItems.length ? `<button class="secondary" data-action="confirm-extract">确认保存选中项</button>` : ""}
       </div>
       ${extractView()}
-    </section>
+    </section>` : ""}
     <p class="toast">${esc(state.message)}</p>
   `;
 }
@@ -356,8 +473,15 @@ function field(label, key, value) {
   return `<label class="label">${label}<input data-route-field="${key}" value="${esc(value || "")}" /></label>`;
 }
 
+function folderSelectField(folderId) {
+  return `<label class="label">路线文件夹<select data-route-field="folderId">
+    ${orderedFolders().map((folder) => `<option value="${esc(folder.id)}" ${folder.id === (folderId || "folder_uncategorized") ? "selected" : ""}>${esc(folder.name)}</option>`).join("")}
+  </select></label>`;
+}
+
 function cityListView(route) {
   const cities = orderedCities(route);
+  const editable = canEdit();
   return `
     <div class="grid three">
       ${cities.map((city) => {
@@ -373,8 +497,10 @@ function cityListView(route) {
             </div>
             <div class="actions">
               <button class="secondary" data-city="${city.id}">查看详情</button>
-              <button class="secondary" data-action="toggle-city" data-city-id="${city.id}">${city.enabled === false ? "启用" : "临时跳过"}</button>
-              <button class="secondary danger" data-action="delete-city" data-city-id="${city.id}">删除城市</button>
+              ${editable ? `
+                <button class="secondary" data-action="toggle-city" data-city-id="${city.id}">${city.enabled === false ? "启用" : "临时跳过"}</button>
+                <button class="secondary danger" data-action="delete-city" data-city-id="${city.id}">删除城市</button>
+              ` : ""}
             </div>
           </div>
         `;
@@ -401,7 +527,8 @@ function routeMapView(route) {
 
 function mapCityPanel(city) {
   const counts = itemCounts(city);
-  const editing = state.mapEditingCityId === city.id;
+  const editable = canEdit();
+  const editing = editable && state.mapEditingCityId === city.id;
   return `
     <aside class="map-panel">
       <button class="panel-close" data-action="close-map-city" aria-label="关闭城市卡片">×</button>
@@ -424,10 +551,12 @@ function mapCityPanel(city) {
           <span class="chip">景点 ${counts.attractions}</span>
         </div>
         <div class="actions">
-          <button data-action="edit-map-city">编辑城市</button>
-          <button class="secondary" data-action="toggle-city" data-city-id="${city.id}">${city.enabled === false ? "启用" : "临时跳过"}</button>
+          ${editable ? `
+            <button data-action="edit-map-city">编辑城市</button>
+            <button class="secondary" data-action="toggle-city" data-city-id="${city.id}">${city.enabled === false ? "启用" : "临时跳过"}</button>
+          ` : ""}
           <button class="secondary" data-city="${city.id}">查看详情</button>
-          <button class="secondary danger" data-action="delete-city" data-city-id="${city.id}">删除城市</button>
+          ${editable ? `<button class="secondary danger" data-action="delete-city" data-city-id="${city.id}">删除城市</button>` : ""}
         </div>
       `}
     </aside>
@@ -649,6 +778,32 @@ function extractItemRow(item, index) {
 }
 
 function cityView(route, city) {
+  const editable = canEdit();
+  if (!editable) {
+    return `
+      <button class="ghost" data-action="back-route">← 返回路线</button>
+      <section class="route-head">
+        <h2>${esc(city.name)}</h2>
+        <div class="stats">
+          <span class="chip">${esc(city.days || "停留天数未填")}</span>
+          ${city.keywords ? `<span class="chip">${esc(city.keywords)}</span>` : ""}
+          ${city.enabled === false ? `<span class="chip">临时跳过</span>` : ""}
+        </div>
+        ${city.reason ? `<p>${esc(city.reason)}</p>` : ""}
+        ${city.notes ? `<p>${esc(city.notes)}</p>` : ""}
+      </section>
+      ${collection("景点", "attractions", city.attractions, [
+        ["名称", "name"], ["地址", "address"], ["是否值得绕路", "worthDetour"], ["自己备注", "notes"]
+      ])}
+      ${collection("宾馆", "hotels", city.hotels, [
+        ["名称", "name"], ["地址", "address"], ["自己备注", "notes"]
+      ])}
+      ${collection("餐厅", "restaurants", city.restaurants, [
+        ["名称", "name"], ["地址", "address"], ["是否值得专门去", "worthVisit"], ["自己备注", "notes"]
+      ])}
+      <p class="toast">${esc(state.message)}</p>
+    `;
+  }
   return `
     <button class="ghost" data-action="back-route">← 返回路线</button>
     <section class="route-head">
@@ -685,11 +840,12 @@ function cityField(label, key, value) {
 }
 
 function collection(title, key, items = [], fields) {
+  const editable = canEdit();
   return `
     <section class="card">
       <h3 class="section-title">${title}</h3>
       <div class="item-list">
-        ${items.map((item) => `
+        ${items.map((item) => editable ? `
           <div class="item" data-item="${item.id}">
             <div class="grid two">
               ${fields.map(([label, field]) => {
@@ -703,12 +859,20 @@ function collection(title, key, items = [], fields) {
               }).join("")}
             </div>
           </div>
+        ` : `
+          <div class="item" data-item="${item.id}">
+            <h4>${esc(item.name || "未命名")}</h4>
+            ${item.address ? `<p class="muted">${esc(item.address)}</p>` : ""}
+            ${item.worthDetour ? `<p class="muted">值得绕路</p>` : ""}
+            ${item.worthVisit ? `<p class="muted">值得专门去</p>` : ""}
+            ${item.notes ? `<p>${esc(item.notes)}</p>` : ""}
+          </div>
         `).join("") || `<p class="muted">还没保存${title}。</p>`}
       </div>
-      <div class="actions">
+      ${editable ? `<div class="actions">
         <button class="secondary" data-add-item="${key}">添加${title}</button>
         <button data-action="save-city">保存${title}</button>
-      </div>
+      </div>` : ""}
     </section>
   `;
 }
@@ -801,6 +965,42 @@ app.addEventListener("change", (event) => {
   if (event.target.dataset.field) state[event.target.dataset.field] = event.target.value;
 });
 
+app.addEventListener("dragstart", (event) => {
+  if (!canEdit()) return;
+  const row = closestFrom(event.target, "[data-drag-route-id]");
+  if (!row) return;
+  event.dataTransfer.setData("text/plain", row.dataset.dragRouteId);
+  event.dataTransfer.effectAllowed = "move";
+});
+
+app.addEventListener("dragover", (event) => {
+  if (!canEdit()) return;
+  const folder = closestFrom(event.target, "[data-folder-drop]");
+  if (!folder) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+});
+
+app.addEventListener("drop", async (event) => {
+  if (!canEdit()) return;
+  const folder = closestFrom(event.target, "[data-folder-drop]");
+  if (!folder) return;
+  event.preventDefault();
+  const routeId = event.dataTransfer.getData("text/plain");
+  const route = state.data.routes.find((entry) => entry.id === routeId);
+  if (!route || route.folderId === folder.dataset.folderDrop) return;
+  try {
+    const updated = { ...route, folderId: folder.dataset.folderDrop };
+    const saved = await api(`/api/routes/${route.id}`, { method: "PUT", body: updated });
+    replaceRoute(saved);
+    state.message = "路线已移动到文件夹。";
+    render();
+  } catch (error) {
+    state.message = error.message;
+    render();
+  }
+});
+
 document.addEventListener("click", (event) => {
   const closeMapCity = closestFrom(event.target, "[data-action='close-map-city']");
   if (closeMapCity) {
@@ -830,6 +1030,33 @@ app.addEventListener("click", async (event) => {
   const action = actionTarget?.dataset.action;
 
   try {
+    if (action === "login-admin") {
+      const result = await api("/api/admin/login", { method: "POST", body: { password: state.adminPassword } });
+      state.adminAuthenticated = Boolean(result.authenticated);
+      state.adminPassword = "";
+      state.message = "已进入后台。";
+      await load();
+      return;
+    }
+    if (action === "logout-admin") {
+      await api("/api/admin/logout", { method: "POST", body: {} });
+      state.adminAuthenticated = false;
+      state.selectedCityId = null;
+      state.message = "已退出后台。";
+      render();
+      return;
+    }
+    const editActions = new Set([
+      "move-city", "delete-route", "save-route", "save-route-edit", "add-city",
+      "save-city", "toggle-city", "delete-city", "edit-map-city", "cancel-map-edit",
+      "save-map-city", "delete-extract-item", "extract", "confirm-extract",
+      "add-folder", "save-folder", "delete-folder", "move-folder"
+    ]);
+    if (editActions.has(action) && !canEdit()) {
+      state.message = "前台为只读模式。";
+      render();
+      return;
+    }
     if (mapMarker) {
       return;
     } else if (action === "select-map-city") {
@@ -887,6 +1114,35 @@ app.addEventListener("click", async (event) => {
     } else if (action === "home") {
       state.selectedRouteId = null;
       state.selectedCityId = null;
+      render();
+    } else if (action === "add-folder") {
+      const name = String(state.newFolderName || "").trim();
+      if (!name) return;
+      state.data = await api("/api/folders", { method: "POST", body: { name } });
+      state.newFolderName = "";
+      state.message = "文件夹已新增。";
+      render();
+    } else if (action === "save-folder") {
+      const folderId = closestFrom(event.target, "[data-folder-id]")?.dataset.folderId;
+      const input = document.querySelector(`[data-folder-name="${CSS.escape(folderId)}"]`);
+      if (!folderId || !input) return;
+      state.data = await api(`/api/folders/${folderId}`, { method: "PUT", body: { name: input.value } });
+      state.message = "文件夹已保存。";
+      render();
+    } else if (action === "delete-folder") {
+      const folderId = closestFrom(event.target, "[data-folder-id]")?.dataset.folderId;
+      const folder = orderedFolders().find((entry) => entry.id === folderId);
+      if (!folder) return;
+      const ok = window.confirm(`确定删除文件夹「${folder.name}」吗？其中路线会移到“未分类”。`);
+      if (!ok) return;
+      state.data = await api(`/api/folders/${folderId}`, { method: "DELETE" });
+      state.message = "文件夹已删除，路线已移到未分类。";
+      render();
+    } else if (action === "move-folder") {
+      const folderId = closestFrom(event.target, "[data-folder-id]")?.dataset.folderId;
+      const direction = closestFrom(event.target, "[data-direction]")?.dataset.direction;
+      state.data = await api(`/api/folders/${folderId}/move`, { method: "POST", body: { direction } });
+      state.message = "文件夹顺序已更新。";
       render();
     } else if (action === "save-route") {
       const route = await api("/api/routes", { method: "POST", body: { text: state.captureText } });

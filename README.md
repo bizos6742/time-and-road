@@ -47,6 +47,7 @@ PORT=4212 npm start
 AMAP_WEB_SERVICE_KEY=你的高德Web服务Key
 AMAP_JS_API_KEY=你的高德JSAPIKey
 AMAP_SECURITY_JS_CODE=你的高德JS安全密钥
+ADMIN_PASSWORD=你的后台管理密码
 ```
 
 示例启动：
@@ -55,6 +56,7 @@ AMAP_SECURITY_JS_CODE=你的高德JS安全密钥
 AMAP_WEB_SERVICE_KEY=你的高德Web服务Key \
 AMAP_JS_API_KEY=你的高德JSAPIKey \
 AMAP_SECURITY_JS_CODE=你的高德JS安全密钥 \
+ADMIN_PASSWORD=你的后台管理密码 \
 npm start
 ```
 
@@ -63,6 +65,17 @@ npm start
 - `AMAP_WEB_SERVICE_KEY`：后端调用高德 Web 服务，用于地理编码和驾车距离计算。
 - `AMAP_JS_API_KEY`：后端代理加载高德 JS API，用于前端地图展示。
 - `AMAP_SECURITY_JS_CODE`：高德 JS API 安全密钥。
+- `ADMIN_PASSWORD`：后台管理入口 `/admin` 的管理员密码。
+
+## 后台管理
+
+前台为只读浏览模式。管理员可以访问：
+
+```text
+http://localhost:4173/admin
+```
+
+输入 `ADMIN_PASSWORD` 后进入后台，可以维护路线、城市、文件夹和旅行资料。
 
 ## 数据保存
 
@@ -82,4 +95,3 @@ data/notebook.json
 - `node_modules` 没有被提交
 - `data/notebook.json` 没有被提交到公开仓库
 - 代码中没有硬编码任何高德 Key
-

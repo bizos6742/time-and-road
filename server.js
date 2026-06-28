@@ -1,5 +1,6 @@
 import http from "node:http";
 import https from "node:https";
+import { randomBytes } from "node:crypto";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -13,6 +14,8 @@ const PORT = Number(process.env.PORT || 4173);
 const AMAP_WEB_SERVICE_KEY = process.env.AMAP_WEB_SERVICE_KEY || "";
 const AMAP_JS_API_KEY = process.env.AMAP_JS_API_KEY || "";
 const AMAP_SECURITY_JS_CODE = process.env.AMAP_SECURITY_JS_CODE || "";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "time-and-road-admin";
+const ADMIN_COOKIE = "time_and_road_admin";
 const AMAP_REQUEST_INTERVAL_MS = 500;
 let amapScriptCache = "";
 let amapScriptPromise = null;
@@ -29,9 +32,12 @@ const inFlightGeocodes = new Map();
 const inFlightDirections = new Map();
 const inFlightMapData = new Map();
 const inFlightDistance = new Map();
+const adminSessions = new Set();
+const UNCATEGORIZED_FOLDER_ID = "folder_uncategorized";
 
 const emptyData = {
   settings: { volcanoKey: "" },
+  folders: [{ id: UNCATEGORIZED_FOLDER_ID, name: "未分类", sortOrder: 0 }],
   geocodeCache: {},
   distanceCache: {},
   routes: []
@@ -71,11 +77,59 @@ function send(res, status, body, contentType = "application/json") {
   res.end(contentType === "application/json" ? JSON.stringify(body) : body);
 }
 
+function sendWithHeaders(res, status, body, headers = {}, contentType = "application/json") {
+  res.writeHead(status, { "Content-Type": contentType, ...headers });
+  res.end(contentType === "application/json" ? JSON.stringify(body) : body);
+}
+
 function publicData(data) {
   return {
     ...data,
     settings: { volcanoKey: data.settings?.volcanoKey || "" },
+    folders: data.folders || [],
     routes: data.routes || []
+  };
+}
+
+function parseCookies(req) {
+  return Object.fromEntries(String(req.headers.cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const index = part.indexOf("=");
+      if (index < 0) return [part, ""];
+      return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+    }));
+}
+
+function isAdmin(req) {
+  const token = parseCookies(req)[ADMIN_COOKIE];
+  return Boolean(token && adminSessions.has(token));
+}
+
+function requireAdmin(req, res) {
+  if (isAdmin(req)) return true;
+  send(res, 401, { error: "Unauthorized" });
+  return false;
+}
+
+function createAdminSession(res) {
+  const token = randomBytes(32).toString("hex");
+  adminSessions.add(token);
+  return {
+    token,
+    headers: {
+      "Set-Cookie": `${ADMIN_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000`
+    }
+  };
+}
+
+function clearAdminSession(req) {
+  const token = parseCookies(req)[ADMIN_COOKIE];
+  if (token) adminSessions.delete(token);
+  return {
+    "Set-Cookie": `${ADMIN_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`
   };
 }
 
@@ -98,9 +152,12 @@ function normalizeCities(cities = []) {
 }
 
 function normalizeData(data) {
+  data.folders = normalizeFolders(data.folders || []);
   data.geocodeCache = data.geocodeCache || {};
   data.distanceCache = data.distanceCache || {};
+  const validFolderIds = new Set(data.folders.map((folder) => folder.id));
   for (const route of data.routes || []) {
+    if (!route.folderId || !validFolderIds.has(route.folderId)) route.folderId = UNCATEGORIZED_FOLDER_ID;
     route.cities = normalizeCities(route.cities || []);
     for (const city of route.cities) {
       city.attractions = (city.attractions || [])
@@ -157,6 +214,33 @@ function normalizeData(data) {
   }
 }
 
+function normalizeFolders(folders = []) {
+  const seen = new Set();
+  const normalized = folders
+    .filter((folder) => folder && String(folder.name || "").trim())
+    .map((folder, index) => ({
+      id: folder.id || id("folder"),
+      name: String(folder.name || "").trim(),
+      sortOrder: Number.isFinite(Number(folder.sortOrder)) ? Number(folder.sortOrder) : index + 1,
+      _fallbackOrder: index + 1
+    }))
+    .filter((folder) => {
+      if (seen.has(folder.id)) return false;
+      seen.add(folder.id);
+      return true;
+    });
+  if (!normalized.some((folder) => folder.id === UNCATEGORIZED_FOLDER_ID)) {
+    normalized.unshift({ id: UNCATEGORIZED_FOLDER_ID, name: "未分类", sortOrder: 0, _fallbackOrder: 0 });
+  }
+  return normalized
+    .map((folder) => folder.id === UNCATEGORIZED_FOLDER_ID ? { ...folder, name: "未分类", sortOrder: 0 } : folder)
+    .sort((a, b) => (a.sortOrder - b.sortOrder) || (a._fallbackOrder - b._fallbackOrder))
+    .map(({ _fallbackOrder, ...folder }, index) => ({
+      ...folder,
+      sortOrder: folder.id === UNCATEGORIZED_FOLDER_ID ? 0 : index + 1
+    }));
+}
+
 function invalidateRouteMap(route) {
   route.map = {
     cities: route.map?.cities || [],
@@ -208,6 +292,7 @@ function preserveRouteFields(route) {
     totalDays: route.totalDays,
     bestSeason: route.bestSeason,
     tags: route.tags,
+    folderId: route.folderId,
     notes: route.notes,
     sourceText: route.sourceText
   };
@@ -922,7 +1007,8 @@ function applyExtracted(route, items, mode = "add") {
 }
 
 async function serveStatic(req, res) {
-  const requested = req.url === "/" ? "/index.html" : decodeURIComponent(req.url.split("?")[0]);
+  const routePath = decodeURIComponent(req.url.split("?")[0]);
+  const requested = routePath === "/" || routePath === "/admin" ? "/index.html" : routePath;
   const safePath = path.normalize(requested).replace(/^(\.\.[/\\])+/, "");
   const filePath = path.join(PUBLIC_DIR, safePath);
   try {
@@ -976,6 +1062,25 @@ const server = http.createServer(async (req, res) => {
 
     const data = await loadData();
 
+    if (req.method === "GET" && url.pathname === "/api/admin/session") {
+      return send(res, 200, { authenticated: isAdmin(req) });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/login") {
+      const body = await readBody(req);
+      if (String(body.password || "") !== ADMIN_PASSWORD) return send(res, 401, { error: "密码不正确" });
+      const session = createAdminSession(res);
+      return sendWithHeaders(res, 200, { authenticated: true }, session.headers);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/logout") {
+      return sendWithHeaders(res, 200, { authenticated: false }, clearAdminSession(req));
+    }
+
+    if (["POST", "PUT", "DELETE"].includes(req.method) && !url.pathname.startsWith("/api/admin/")) {
+      if (!requireAdmin(req, res)) return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/data") return send(res, 200, publicData(data));
     if (req.method === "PUT" && url.pathname === "/api/settings") {
       const body = await readBody(req);
@@ -983,9 +1088,69 @@ const server = http.createServer(async (req, res) => {
       await saveData(data);
       return send(res, 200, publicData(data).settings);
     }
+
+    if (req.method === "POST" && url.pathname === "/api/folders") {
+      const body = await readBody(req);
+      const name = String(body.name || "").trim();
+      if (!name) return send(res, 400, { error: "文件夹名称不能为空" });
+      const maxOrder = Math.max(0, ...(data.folders || []).map((folder) => Number(folder.sortOrder) || 0));
+      const folder = { id: id("folder"), name, sortOrder: maxOrder + 1 };
+      data.folders.push(folder);
+      data.folders = normalizeFolders(data.folders);
+      await saveData(data);
+      return send(res, 201, publicData(data));
+    }
+
+    const folderMatch = url.pathname.match(/^\/api\/folders\/([^/]+)$/);
+    if (folderMatch && req.method === "PUT") {
+      const folder = data.folders.find((entry) => entry.id === folderMatch[1]);
+      if (!folder) return send(res, 404, { error: "文件夹不存在" });
+      const body = await readBody(req);
+      if (folder.id !== UNCATEGORIZED_FOLDER_ID && body.name !== undefined) {
+        const name = String(body.name || "").trim();
+        if (!name) return send(res, 400, { error: "文件夹名称不能为空" });
+        folder.name = name;
+      }
+      if (body.sortOrder !== undefined && folder.id !== UNCATEGORIZED_FOLDER_ID) folder.sortOrder = Number(body.sortOrder) || folder.sortOrder;
+      data.folders = normalizeFolders(data.folders);
+      await saveData(data);
+      return send(res, 200, publicData(data));
+    }
+
+    if (folderMatch && req.method === "DELETE") {
+      if (folderMatch[1] === UNCATEGORIZED_FOLDER_ID) return send(res, 400, { error: "未分类不能删除" });
+      const before = data.folders.length;
+      data.folders = data.folders.filter((folder) => folder.id !== folderMatch[1]);
+      if (data.folders.length === before) return send(res, 404, { error: "文件夹不存在" });
+      for (const route of data.routes || []) {
+        if (route.folderId === folderMatch[1]) route.folderId = UNCATEGORIZED_FOLDER_ID;
+      }
+      data.folders = normalizeFolders(data.folders);
+      await saveData(data);
+      return send(res, 200, publicData(data));
+    }
+
+    const folderMoveMatch = url.pathname.match(/^\/api\/folders\/([^/]+)\/move$/);
+    if (folderMoveMatch && req.method === "POST") {
+      if (folderMoveMatch[1] === UNCATEGORIZED_FOLDER_ID) return send(res, 400, { error: "未分类不能移动" });
+      data.folders = normalizeFolders(data.folders);
+      const body = await readBody(req);
+      const index = data.folders.findIndex((folder) => folder.id === folderMoveMatch[1]);
+      const targetIndex = body.direction === "up" ? index - 1 : index + 1;
+      if (index < 0) return send(res, 404, { error: "文件夹不存在" });
+      if (targetIndex <= 0 || targetIndex >= data.folders.length) return send(res, 200, publicData(data));
+      const currentOrder = data.folders[index].sortOrder;
+      data.folders[index].sortOrder = data.folders[targetIndex].sortOrder;
+      data.folders[targetIndex].sortOrder = currentOrder;
+      data.folders = normalizeFolders(data.folders);
+      await saveData(data);
+      return send(res, 200, publicData(data));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/routes") {
       const body = await readBody(req);
       const route = parseRouteText(body.text);
+      if (body.folderId && data.folders.some((folder) => folder.id === body.folderId)) route.folderId = body.folderId;
       data.routes.unshift(route);
       await saveData(data);
       return send(res, 201, route);

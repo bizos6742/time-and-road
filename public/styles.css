@@ -97,7 +97,47 @@ textarea {
 
 .route-list {
   display: grid;
+  gap: 12px;
+}
+
+.folder-block {
+  display: grid;
+  gap: 6px;
+}
+
+.folder-head {
+  display: flex;
+  justify-content: space-between;
   gap: 8px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px 2px;
+}
+
+.folder-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.folder-tools {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 18px;
+}
+
+.folder-name-input {
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.admin-link {
+  display: inline-block;
+  color: var(--accent);
+  font-size: 13px;
+  margin-top: 10px;
+  text-decoration: none;
 }
 
 .route-row {
