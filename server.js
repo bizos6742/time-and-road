@@ -302,6 +302,68 @@ function restoreRouteFields(route, fields) {
   Object.assign(route, fields);
 }
 
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object || {}, key);
+}
+
+function routeNameFromBody(body, fallback = "") {
+  if (hasOwn(body, "name")) return String(body.name || "").trim();
+  if (hasOwn(body, "title")) return String(body.title || "").trim();
+  return fallback;
+}
+
+function routeNotesFromBody(body, fallback = "") {
+  if (hasOwn(body, "notes")) return String(body.notes || "");
+  if (hasOwn(body, "summary")) return String(body.summary || "");
+  return fallback;
+}
+
+function normalizeRouteTags(value) {
+  if (Array.isArray(value)) return value.map((tag) => String(tag || "").trim()).filter(Boolean);
+  return String(value || "").split(/[，,]/).map((tag) => tag.trim()).filter(Boolean);
+}
+
+function routePatchFromBody(body, data, route = {}) {
+  const patch = {};
+  const nextName = routeNameFromBody(body, route.name || "");
+  if (hasOwn(body, "name") || hasOwn(body, "title")) patch.name = nextName;
+  if (hasOwn(body, "start")) patch.start = String(body.start || "").trim();
+  if (hasOwn(body, "end")) patch.end = String(body.end || "").trim();
+  if (hasOwn(body, "totalDays")) patch.totalDays = String(body.totalDays || "").trim();
+  if (hasOwn(body, "bestSeason")) patch.bestSeason = String(body.bestSeason || "").trim();
+  if (hasOwn(body, "tags")) patch.tags = normalizeRouteTags(body.tags);
+  if (hasOwn(body, "notes") || hasOwn(body, "summary")) patch.notes = routeNotesFromBody(body, route.notes || "");
+  if (hasOwn(body, "folderId")) {
+    patch.folderId = data.folders.some((folder) => folder.id === body.folderId) ? body.folderId : UNCATEGORIZED_FOLDER_ID;
+  }
+  return patch;
+}
+
+function createRouteFromBody(body, data) {
+  const hasText = String(body.text || "").trim().length > 0;
+  const route = hasText ? parseRouteText(body.text) : {
+    id: id("route"),
+    name: routeNameFromBody(body, "未命名路线") || "未命名路线",
+    start: "",
+    end: "",
+    totalDays: "",
+    bestSeason: "",
+    tags: [],
+    notes: "",
+    sourceText: "",
+    cities: [],
+    map: { segments: [], totalDistanceKm: null, updatedAt: null, error: "" },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  Object.assign(route, routePatchFromBody(body, data, route));
+  if (!route.folderId || !data.folders.some((folder) => folder.id === route.folderId)) {
+    route.folderId = UNCATEGORIZED_FOLDER_ID;
+  }
+  route.cities = normalizeCities(route.cities || []);
+  return route;
+}
+
 function segmentCacheKey(from, to) {
   return `${from}|||${to}`;
 }
@@ -1149,8 +1211,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/routes") {
       const body = await readBody(req);
-      const route = parseRouteText(body.text);
-      if (body.folderId && data.folders.some((folder) => folder.id === body.folderId)) route.folderId = body.folderId;
+      const route = createRouteFromBody(body, data);
       data.routes.unshift(route);
       await saveData(data);
       return send(res, 201, route);
@@ -1168,8 +1229,13 @@ const server = http.createServer(async (req, res) => {
     if (routeMatch && req.method === "PUT") {
       const route = data.routes.find((entry) => entry.id === routeMatch[1]);
       if (!route) return send(res, 404, { error: "路线不存在" });
-      Object.assign(route, await readBody(req), { updatedAt: new Date().toISOString() });
-      route.cities = normalizeCities(route.cities || []);
+      const body = await readBody(req);
+      const patch = routePatchFromBody(body, data, route);
+      Object.assign(route, patch);
+      if (hasOwn(body, "sourceText")) route.sourceText = String(body.sourceText || "");
+      if (hasOwn(body, "cities")) route.cities = normalizeCities(body.cities || []);
+      else route.cities = normalizeCities(route.cities || []);
+      route.updatedAt = new Date().toISOString();
       invalidateRouteMap(route);
       await saveData(data);
       return send(res, 200, route);
