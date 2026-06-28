@@ -242,7 +242,14 @@ async function applyServerRouteChange(request, message, keepCityId = null) {
   const before = selectedRoute();
   if (before) printCityOrders("前端当前 cities:", before);
   const serverRoute = await request();
-  const route = mergeCityOnlyRouteUpdate(before, serverRoute);
+  let freshRoute = serverRoute;
+  if (serverRoute?.id) {
+    const freshData = await api("/api/data");
+    state.data = freshData;
+    state.selectedRouteId = serverRoute.id;
+    freshRoute = selectedRoute() || serverRoute;
+  }
+  const route = mergeCityOnlyRouteUpdate(before, freshRoute);
   printCityOrders("后端返回 cities:", route);
   replaceRoute(route);
   state.selectedCityId = keepCityId;
